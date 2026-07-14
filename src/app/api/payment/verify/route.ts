@@ -1,0 +1,139 @@
+/**
+ * POST /api/payment/verify
+ *
+ * Client-side confirmation endpoint. Defense in depth on top of the webhook
+ * (which is the source of truth).
+ *
+ * Phase 3.6b: business logic in `@/lib/domain/payment/service`.
+ *
+ * Coupon usage: for partial-discount payments the coupon must be consumed
+ * here (after the Razorpay payment is confirmed) so usage count is
+ * incremented. The 100%-off path goes through `/api/payment/redeem-coupon`
+ * instead.
+ */
+
+import { z } from "zod";
+import { withRequest, withCheckoutSession, withCsrf, withRateLimit } from "@/lib/api/handlers";
+import { ok } from "@/lib/api/response";
+import { parse } from "@/lib/api/parse";
+import { verifyPayment as verifyPaymentService } from "@/lib/domain/payment/service";
+import { getSetting } from "@/lib/settings";
+import { MongooseUserRepo, MongoosePaymentRepo, MongooseCouponRepo } from "@/lib/infra/db/mongoose-repos";
+import { signAuth } from "@/lib/auth/crypto";
+import { setAuthCookie, clearPendingCookie } from "@/lib/auth/cookies";
+import { logger } from "@/lib/logger";
+import { REGISTRATION_AMOUNT_PAISE } from "@/lib/razorpay";
+import { limiterFor } from "@/lib/api/rate-limit";
+import { runInTransaction } from "@/lib/infra/db/transaction";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const schema = z.object({
+    orderId: z.string().min(1),
+    paymentId: z.string().min(1),
+    signature: z.string().min(1),
+    couponId: z.string().optional(),
+    couponCode: z.string().trim().min(1).optional(),
+});
+
+export const POST = withRequest(
+    withRateLimit(
+        { capacity: 10, refillPerSec: 10 / 60 },
+        limiterFor("payment-verify"),
+    )(
+    withCheckoutSession(
+        withCsrf(async ({ req }: { req: Request }) => {
+    const body = parse(await req.json().catch(() => ({})), schema);
+    const userRepo = new MongooseUserRepo();
+
+    const result = await verifyPaymentService({
+        paymentId: body.paymentId,
+        orderId: body.orderId,
+        signature: body.signature,
+        secret: (await getSetting("razorpay_key_secret")) ?? "",
+        userRepo,
+        paymentRepo: new MongoosePaymentRepo(),
+    });
+
+    // If a coupon was applied to this payment, record usage now.
+    // At this point the Razorpay payment is confirmed, so we just need
+    // to guard against double-counting (`findUsageForUser`) and ensure
+    // the coupon still exists.
+    const paymentCouponId = body.couponId ?? result.payment?.couponId?.toString();
+    const paymentCouponCode = body.couponCode ?? result.payment?.couponCode;
+    if (paymentCouponId && paymentCouponCode) {
+        const couponRepo = new MongooseCouponRepo();
+        const code = paymentCouponCode.trim().toUpperCase();
+        const coupon = await couponRepo.findByCode(code);
+        if (coupon && String(coupon._id) === String(paymentCouponId)) {
+            const userId = String(result.user._id);
+            const paidAmountPaise = Number(result.payment?.amount ?? 0);
+            const discountApplied =
+                result.payment?.couponDiscount ?? Math.max(0, REGISTRATION_AMOUNT_PAISE - paidAmountPaise) / 100;
+            // Audit C3: coupon grant + user-update must be atomic so we
+            // can't leave usedCount bumped without a CouponUsage row.
+            await runInTransaction(async (session) => {
+                const opts = session ? { session } : {};
+                const existing = await couponRepo.findUsageForUser(String(coupon._id), userId);
+                if (!existing) {
+                    await couponRepo.incrementUsage(String(coupon._id), opts);
+                    await couponRepo.createUsage(
+                        {
+                            couponId: String(coupon._id) as any,
+                            userId: userId as any,
+                            code,
+                            discountApplied,
+                            orderId: body.orderId,
+                        },
+                        opts,
+                    );
+                    logger.info("coupon.used_for_payment", {
+                        userId,
+                        code,
+                        discount: discountApplied,
+                        paymentId: body.paymentId,
+                    });
+                }
+                await userRepo.update(
+                    userId,
+                    {
+                        couponId: String(coupon._id) as any,
+                        couponCode: code,
+                        couponDiscount: discountApplied,
+                        couponAppliedAt: new Date(),
+                    },
+                    opts,
+                );
+            }, { label: "verify.couponGrant" });
+        } else {
+            logger.warn("coupon.verify_mismatch", {
+                code,
+                couponId: paymentCouponId,
+                found: !!coupon,
+                paymentId: body.paymentId,
+            });
+        }
+    }
+
+    // Re-issue the auth cookie with paid:true so the user lands on /dashboard
+    // without going through /login again. If they only had a pending cookie,
+    // upgrade it to full auth.
+    const authToken = await signAuth({
+        sub: result.user._id.toString(),
+        phone: result.user.phone,
+        paid: true,
+    });
+    await setAuthCookie(authToken);
+    await clearPendingCookie();
+
+    return ok({
+        success: true,
+        orderId: body.orderId,
+        paymentId: body.paymentId,
+        redirect: "/dashboard",
+    });
+    }),
+  ),
+  ),
+);

@@ -1,0 +1,53 @@
+import mongoose, { Schema, Model, Document } from "mongoose";
+
+export interface IPayment extends Document {
+    _id: mongoose.Types.ObjectId;
+    userId: mongoose.Types.ObjectId | string;
+    paymentId: string;
+    orderId?: string;
+    amount: number;
+    currency: string;
+    status: "created" | "completed" | "failed" | "refunded";
+    source: "razorpay" | "manual" | "coupon";
+    couponId?: mongoose.Types.ObjectId | string;
+    couponCode?: string;
+    couponDiscount?: number;
+    method?: string;
+    createdAt: Date;
+    updatedAt: Date;
+}
+
+const PaymentSchema = new Schema<IPayment>(
+    {
+        userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+        // Razorpay payment ids are globally unique — enforcing uniqueness
+        // at the schema level blocks duplicate-fulfillment attacks where
+        // a verify-path + webhook-path race could otherwise insert two
+        // Payment rows for the same Razorpay id. (Audit C4.)
+        // NOTE: requires a one-time migration to deduplicate existing
+        // rows before deploying; the index build will fail on dupes.
+        paymentId: { type: String, required: true, unique: true, index: true },
+        // orderId is also globally unique from Razorpay's side.
+        // (Audit C4.)
+        orderId: { type: String, unique: true, index: true },
+        amount: { type: Number, required: true },
+        currency: { type: String, default: "INR" },
+        status: {
+            type: String,
+            enum: ["created", "completed", "failed", "refunded"],
+            default: "completed",
+            index: true,
+        },
+        source: { type: String, enum: ["razorpay", "manual", "coupon"], default: "razorpay" },
+        couponId: { type: Schema.Types.ObjectId, ref: "Coupon", index: true },
+        couponCode: { type: String, uppercase: true, trim: true, index: true },
+        couponDiscount: { type: Number },
+        method: { type: String },
+    },
+    { timestamps: true },
+);
+
+const Payment: Model<IPayment> =
+    (mongoose.models.Payment as Model<IPayment>) || mongoose.model<IPayment>("Payment", PaymentSchema);
+
+export default Payment;
