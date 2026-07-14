@@ -11,7 +11,7 @@ import Header from "@/components/Header";
 import Footer from "@/components/Footer";
 import { ChatWidget } from "@/components/chat/ChatWidget";
 
-const CHROME_HIDDEN_PREFIXES = ["/login", "/dashboard", "/admin"];
+const CHROME_HIDDEN_PREFIXES = ["/login", "/dashboard", "/admin", "/checkout"];
 
 export default function ClientProviders({ children }: { children: React.ReactNode }) {
     const pathname = usePathname() || "";

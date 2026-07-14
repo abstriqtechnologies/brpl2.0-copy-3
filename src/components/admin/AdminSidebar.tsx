@@ -65,11 +65,17 @@ export function AdminSidebar({
 
     const visibleItems = useMemo(
         () =>
-            NAV_ITEMS.filter((item) => {
-                if (item.superAdminOnly && role !== "superadmin") return false;
-                if (item.area && !hasAccess({ role, accessAreas }, item.area)) return false;
-                return true;
-            }),
+            // Superadmin short-circuit: they must see every nav item regardless
+            // of `area` / `superAdminOnly` flags. Done before per-item filtering
+            // so a stale `accessAreas` or a broken `hasAccess` can never hide
+            // a tab from a superadmin session.
+            role === "superadmin"
+                ? NAV_ITEMS
+                : NAV_ITEMS.filter((item) => {
+                      if (item.superAdminOnly) return false;
+                      if (item.area && !hasAccess({ role, accessAreas }, item.area)) return false;
+                      return true;
+                  }),
         [role, accessAreas],
     );
 

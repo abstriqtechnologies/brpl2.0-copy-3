@@ -281,7 +281,14 @@ export default function CheckoutClient({
                     if (v.ok) {
                         setPhase("Taking you to your dashboard");
                         setSubPhase("Finalizing your registration…");
-                        await finishRegistration();
+                        // Pass the Razorpay response values explicitly —
+                        // React's setPaymentId is async and the closure
+                        // inside finishRegistration would otherwise see the
+                        // pre-handler null state.
+                        await finishRegistration({
+                            paymentId: resp.razorpay_payment_id,
+                            orderId: resp.razorpay_order_id,
+                        });
                     } else {
                         toast({
                             variant: "destructive",
@@ -315,7 +322,7 @@ export default function CheckoutClient({
     };
 
     /* --- Coupon-only path (full coverage) OR post-Razorpay finish --- */
-    const finishRegistration = async () => {
+    const finishRegistration = async (override?: { paymentId?: string; orderId?: string }) => {
         // Guard against double-trigger: both the polling (webhook-first
         // path) and the Razorpay handler (verify-first path) can call
         // finishRegistration. The second call would either hit a 409 on
@@ -389,13 +396,19 @@ export default function CheckoutClient({
                 // paymentId/orderId may be missing here if the webhook arrived
                 // before the Razorpay modal handler ran — the server resolves
                 // them from the User record in that case (see auth/service.ts).
+                // Prefer the override (passed in directly from the Razorpay
+                // handler) over React state — setPaymentId/setOrderId are
+                // async and the closure here would otherwise read a stale
+                // null on the very first call.
+                const finalPaymentId = override?.paymentId ?? paymentId;
+                const finalOrderId = override?.orderId ?? orderId;
                 const regRes = await fetch("/api/auth/register", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         ...form,
-                        ...(paymentId ? { paymentId } : {}),
-                        ...(orderId ? { orderId } : {}),
+                        ...(finalPaymentId ? { paymentId: finalPaymentId } : {}),
+                        ...(finalOrderId ? { orderId: finalOrderId } : {}),
                     }),
                 });
                 const regData = await regRes.json().catch(() => ({}));
@@ -677,7 +690,7 @@ export default function CheckoutClient({
                         {couponCoversAll ? (
                             <Button
                                 type="button"
-                                onClick={finishRegistration}
+                                onClick={() => finishRegistration()}
                                 disabled={busy}
                                 className="w-full h-12 bg-amber-500 hover:bg-amber-600 text-black font-bold text-base rounded-full"
                             >

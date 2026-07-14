@@ -185,26 +185,36 @@ export async function registerUser(input: RegisterUserInput, deps: RegisterUserD
         throw new ConflictError("User already registered for this phone");
     }
 
-    // Build the profile payload. paymentStatus depends on whether we have
-    // payment identifiers. When unpaid, we deliberately omit paymentId/orderId/
-    // amount so the User record reflects "tried to sign up, hasn't paid".
+    // Resolve the effective payment state. Three inputs feed this:
+    //   1. Client-supplied paymentId/orderId (the Razorpay modal handler).
+    //   2. The existing User record (verify/webhook may have stamped "completed"
+    //      BEFORE register's profile save — verify-first race).
+    //   3. Newly-created path (existing is null): trust client only.
+    const clientPaid = hasPayment;
+    const existingPaid = existing?.paymentStatus === "completed" && Boolean(existing.paymentId && existing.orderId);
+    const treatAsPaid = clientPaid || existingPaid;
+
+    // Build the profile payload. paymentStatus honours both the client claim
+    // AND any "completed" stamp the previous step (verify/webhook) already
+    // wrote. When unpaid, we deliberately omit paymentId/orderId/amount so the
+    // User record reflects "tried to sign up, hasn't paid".
     const profile: Record<string, unknown> = {
         name: input.name.trim(),
         email: input.email.trim().toLowerCase(),
         role: input.role,
         state: input.state.trim(),
         city: input.city.trim(),
-        paymentStatus: hasPayment ? "completed" : "pending",
+        paymentStatus: treatAsPaid ? "completed" : "pending",
     };
 
-    if (hasPayment) {
+    if (treatAsPaid) {
         // Resolve paymentId/orderId from the client, falling back to whatever
-        // is already on the User record. The webhook-first race means the
-        // client sometimes doesn't have them.
-        const paymentId = input.paymentId!.trim();
-        const orderId = input.orderId!.trim();
-        profile.paymentId = paymentId || existing?.paymentId;
-        profile.orderId = orderId || existing?.orderId;
+        // is already on the User record. The verify-first / webhook-first
+        // races mean the client sometimes doesn't have them.
+        const paymentId = (input.paymentId ?? "").trim() || existing?.paymentId;
+        const orderId = (input.orderId ?? "").trim() || existing?.orderId;
+        if (paymentId) profile.paymentId = paymentId;
+        if (orderId) profile.orderId = orderId;
         profile.amount = 1499;
     }
 
